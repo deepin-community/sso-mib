@@ -1,15 +1,61 @@
-Source: template-repository
-Section: unknown
-Priority: optional
-Maintainer: Tsic404 <liuheng@deepin.org>
-Build-Depends: debhelper (>= 11)
-Standards-Version: 4.1.3
-Homepage: https://github.com/deepin-community/template-repository
-#Vcs-Browser: https://salsa.debian.org/debian/deepin-community-template-repository
-#Vcs-Git: https://salsa.debian.org/debian/deepin-community-template-repository.git
+Source: sso-mib
+Section: libs
+Maintainer: Luca Boccassi <bluca@debian.org>
+Build-Depends: debhelper-compat (= 13),
+               dh-package-notes,
+               dh-sequence-bash-completion,
+               bash-completion,
+               libdbus-1-dev,
+               libgio-2.0-dev | libgio3.0-cil-dev,
+               libjson-glib-dev,
+               libjwt-dev,
+               meson,
+               pkgconf,
+               uuid-dev,
+Standards-Version: 4.7.4
+Homepage: https://siemens.github.io/sso-mib/
+Vcs-Browser: https://salsa.debian.org/debian/sso-mib
+Vcs-Git: https://salsa.debian.org/debian/sso-mib.git
 
-Package: template-repository
+Package: libsso-mib-dev
+Section: libdevel
 Architecture: any
-Depends: ${shlibs:Depends}, ${misc:Depends}
-Description: <insert up to 60 chars description>
- <insert long description, indented with spaces>
+Multi-Arch: same
+Depends: libgio-2.0-dev | libgio3.0-cil-dev,
+         libsso-mib0 (= ${binary:Version}),
+         uuid-dev,
+         ${misc:Depends},
+Description: Single-Sign-On with CA for Entra via Himmelblau (devel files)
+ Applications can link with this library to get Entra Conditional Access tokens
+ for authentication and Single-Sign-On from the Himmelblau stack.
+ .
+ Contains the development files for the shared library.
+
+Package: libsso-mib0
+Architecture: any
+Multi-Arch: same
+Depends: ${misc:Depends}, ${shlibs:Depends},
+Description: Single-Sign-On with CA for Entra via Himmelblau (library)
+ Applications can link with this library to get Entra Conditional Access tokens
+ for authentication and Single-Sign-On from the Himmelblau stack.
+ .
+ Contains the shared library.
+
+Package: sso-mib-tool
+Architecture: any
+Depends: ${misc:Depends}, ${shlibs:Depends},
+Description: Single-Sign-On with CA for Entra via Himmelblau (tool)
+ Applications can link with this library to get Entra Conditional Access tokens
+ for authentication and Single-Sign-On from the Himmelblau stack.
+ .
+ Contains command line tools that use the shared library.
+
+Package: sso-mib-gch-smtp-o365
+Architecture: any
+Depends: ${misc:Depends}, ${shlibs:Depends},
+Enhances: git
+Description: Single-Sign-On with CA for Entra via Himmelblau (git send-email)
+ Applications can link with this library to get Entra Conditional Access tokens
+ for authentication and Single-Sign-On from the Himmelblau stack.
+ .
+ Contains git send-email credential helper to authenticate SMTP on O365.

@@ -1,4 +1,7 @@
 #!/usr/bin/make -f
 
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+include /usr/share/debhelper/dh_package_notes/package-notes.mk
+
 %:
 	dh $@
