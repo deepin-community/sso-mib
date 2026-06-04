@@ -1,0 +1,102 @@
+#!/bin/bash
+# SPDX-License-Identifier: LGPL-2.1-only
+#
+# Build the upstream examples against the installed libsso-mib-dev and
+# attempt to run them. The examples require a Microsoft Identity Broker
+# on the session bus and valid Entra ID credentials, neither of which is
+# available in autopkgtest, so we only require that they start up and
+# fail in a controlled way (i.e. do not crash and exit within the
+# timeout).
+set -eux
+
+# Re-exec ourselves under a private session bus so the examples can
+# attempt the DBus call (and fail cleanly because no broker is
+# registered) instead of erroring out on missing
+# DBUS_SESSION_BUS_ADDRESS.
+if [ -z "${SSO_MIB_TEST_INNER:-}" ]; then
+    export SSO_MIB_TEST_INNER=1
+    exec dbus-run-session -- "$0" "$@"
+fi
+
+basedir=$(dirname "$0")
+srcdir=$(readlink -f "${basedir}/../..")
+workdir=$(mktemp -d)
+trap 'rm -rf "${workdir}"' EXIT
+
+CFLAGS="${CFLAGS:-} $(pkg-config --cflags sso-mib libcurl json-glib-1.0)"
+LIBS="$(pkg-config --libs sso-mib libcurl json-glib-1.0)"
+
+# The example sources include "sso-mib.h" with quotes because they are
+# built in-tree against the local include directory. When building
+# against the installed -dev package the header lives at
+# <sso-mib/sso-mib.h>, so rewrite the include before compiling.
+build_example() {
+    local name=$1
+    local src=$2
+    local out="${workdir}/${name}"
+    sed 's|#include "sso-mib.h"|#include <sso-mib/sso-mib.h>|' \
+        "${src}" > "${workdir}/${name}.c"
+    printf "\n\nBuilding example %s\n" "${name}"
+    # shellcheck disable=SC2086
+    gcc ${CFLAGS} "${workdir}/${name}.c" -o "${out}" ${LIBS}
+    echo "OK"
+
+    printf "\nLinkage info for %s\n" "${name}"
+    ldd "${out}"
+
+    printf "\nChecking that %s links to libsso-mib\n" "${name}"
+    ldd "${out}" | grep -F 'libsso-mib.so'
+    echo "OK"
+}
+
+build_example mib-example-avatar    "${srcdir}/examples/avatar/main.c"
+build_example mib-example-onedrive  "${srcdir}/examples/onedrive/main.c"
+build_example mib-example-smtp-o365 "${srcdir}/examples/smtp-o365/main.c"
+
+# Try to run the examples. They will fail to acquire a token because no
+# Microsoft Identity Broker is reachable in the autopkgtest environment,
+# but they must not crash and must exit within a reasonable time. Any
+# exit code is therefore accepted; only timeouts (124) and fatal signal
+# exits (134=SIGABRT, 137=SIGKILL, 139=SIGSEGV, 143=SIGTERM) are
+# treated as failures.
+is_fatal_rc() {
+    case $1 in
+        124|134|137|139|143) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+run_example() {
+    local bin=$1
+    shift
+    printf "\n\nRunning %s\n" "${bin}"
+    local rc=0
+    timeout --preserve-status 30 "${workdir}/${bin}" "$@" </dev/null || rc=$?
+    echo "exit code: ${rc}"
+    if is_fatal_rc "${rc}"; then
+        echo "FAIL: ${bin} crashed or timed out (rc=${rc})"
+        exit 1
+    fi
+    echo "OK"
+}
+
+run_example mib-example-avatar
+run_example mib-example-onedrive
+
+# git credential helper reads key=value pairs from stdin and a verb on argv.
+printf "\n\nRunning mib-example-smtp-o365 get\n"
+rc=0
+printf 'protocol=smtp\nusername=test@example.com\n\n' | \
+    timeout --preserve-status 30 "${workdir}/mib-example-smtp-o365" get \
+    || rc=$?
+echo "smtp-o365 exit code: ${rc}"
+if is_fatal_rc "${rc}"; then
+    echo "FAIL: mib-example-smtp-o365 crashed or timed out (rc=${rc})"
+    exit 1
+fi
+echo "OK"
+
+# Also smoke-test the installed CLI front-end.
+printf "\n\nRunning sso-mib-tool -h\n"
+sso-mib-tool -h
+echo "OK"

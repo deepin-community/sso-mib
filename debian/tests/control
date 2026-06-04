@@ -1,0 +1,9 @@
+Tests: test-examples
+Restrictions: allow-stderr
+Depends: libsso-mib-dev,
+         libcurl4-openssl-dev | libcurl4-gnutls-dev,
+         libjson-glib-dev,
+         sso-mib-tool,
+         dbus-daemon,
+         build-essential,
+         pkgconf,
