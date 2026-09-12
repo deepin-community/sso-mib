@@ -1,0 +1,38 @@
+sso-mib (0.9.0-1deepin1) unstable; urgency=medium
+
+  * Rebuild with LTO enabled (dpkg vendor feature optimize/lto).
+
+ -- lichenggang <lichenggang@uniontech.com>  Sat, 12 Sep 2026 16:25:46 +0800
+
+sso-mib (0.9.0-1) unstable; urgency=medium
+
+  * Drop Files-Excluded and dversionmangle, upstream dropped debian/ dir
+  * Update upstream source from tag 'upstream/0.9.0'
+
+ -- Luca Boccassi <bluca@debian.org>  Thu, 07 May 2026 15:36:13 +0100
+
+sso-mib (0.8.1+ds-2) unstable; urgency=medium
+
+  * Add autopkgtest
+
+ -- Luca Boccassi <bluca@debian.org>  Thu, 30 Apr 2026 12:17:42 +0100
+
+sso-mib (0.8.1+ds-1) unstable; urgency=medium
+
+  * Update upstream source from tag 'upstream/0.8.1+ds'
+  * Bump Standards-version to 4.7.4
+
+ -- Luca Boccassi <bluca@debian.org>  Thu, 23 Apr 2026 12:30:07 +0100
+
+sso-mib (0.8.0+ds-1) unstable; urgency=medium
+
+  * Drop leading '/' from dh_install files
+  * Update upstream source from tag 'upstream/0.8.0+ds'
+
+ -- Luca Boccassi <bluca@debian.org>  Tue, 17 Mar 2026 10:08:32 +0000
+
+sso-mib (0.7.0+ds-1) unstable; urgency=medium
+
+  * Initial release.
+
+ -- Luca Boccassi <bluca@debian.org>  Fri, 20 Feb 2026 21:40:19 +0000
