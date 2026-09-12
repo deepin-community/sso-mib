@@ -1,3 +1,9 @@
+sso-mib (0.9.0-1deepin1) unstable; urgency=medium
+
+  * Rebuild with LTO enabled (dpkg vendor feature optimize/lto).
+
+ -- lichenggang <lichenggang@uniontech.com>  Sat, 12 Sep 2026 16:25:46 +0800
+
 sso-mib (0.9.0-1) unstable; urgency=medium
 
   * Drop Files-Excluded and dversionmangle, upstream dropped debian/ dir
