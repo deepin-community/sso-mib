@@ -14,8 +14,21 @@
 #include <glib-2.0/glib.h>
 #include <json-glib/json-glib.h>
 
+typedef struct _MIBAccount MIBAccount;
+
 gchar *json_object_to_string(JsonObject *object);
 JsonObject *json_object_from_string(const gchar *data);
 void debug_print_json_object(const gchar *func, const gchar *scope,
 							 JsonObject *object);
 JsonArray *mib_scopes_to_json(GSList *scopes);
+
+/**
+ * Helper to deep copy strings in a GSList.
+ */
+gpointer copy_string(gconstpointer src, MIB_ARG_UNUSED gpointer data);
+
+/**
+ * Find an account matching @upn in a list.
+ * Returns a new reference or NULL.
+ */
+MIBAccount *find_account_by_upn(GSList *accounts, const gchar *upn);

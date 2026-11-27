@@ -56,6 +56,28 @@ struct _MIBClientApp {
 };
 G_DEFINE_TYPE(MIBClientApp, mib_client_app, G_TYPE_OBJECT)
 
+typedef struct {
+	GSList *scopes;
+	enum MIB_PROMPT prompt;
+	gchar *domain_hint;
+	gchar *claims_challenge;
+	MIBPopParams *pop_params;
+	gchar *login_hint;
+	MIBAccount *account;
+} InteractiveAsyncCtx;
+
+static void interactive_async_ctx_free(gpointer data)
+{
+	InteractiveAsyncCtx *ctx = data;
+	g_free(ctx->login_hint);
+	g_free(ctx->domain_hint);
+	g_free(ctx->claims_challenge);
+	g_clear_object(&ctx->pop_params);
+	g_clear_object(&ctx->account);
+	g_slist_free_full(ctx->scopes, g_free);
+	g_free(ctx);
+}
+
 static void mib_client_app_finalize(GObject *gobject)
 {
 	MIBClientApp *priv = MIB_CLIENT_APP(gobject);
@@ -108,7 +130,8 @@ MIBClientApp *mib_public_client_app_new(const gchar *client_id,
 	}
 
 	self->broker = mib_dbus_identity_broker1_proxy_new_for_bus_sync(
-		G_BUS_TYPE_SESSION, G_DBUS_PROXY_FLAGS_NONE, DBUS_BROKER_NAME,
+		G_BUS_TYPE_SESSION,
+		G_DBUS_PROXY_FLAGS_DO_NOT_AUTO_START_AT_CONSTRUCTION, DBUS_BROKER_NAME,
 		DBUS_BROKER_PATH, self->cancellable, error);
 
 	if (!self->broker) {
@@ -136,13 +159,10 @@ static gchar *mib_prompt_to_str(enum MIB_PROMPT prompt)
 	}
 }
 
-static JsonObject *mib_client_app_get_accounts_raw(MIBClientApp *app)
+static gchar *get_accounts_prepare_request(MIBClientApp *app)
 {
-	GError *error = NULL;
-	gchar *response = NULL;
 	JsonBuilder *builder;
 	JsonNode *root;
-	gboolean ok;
 
 	builder = json_builder_new();
 	json_builder_begin_object(builder);
@@ -154,89 +174,32 @@ static JsonObject *mib_client_app_get_accounts_raw(MIBClientApp *app)
 	root = json_builder_get_root(builder);
 	g_object_unref(builder);
 	JsonObject *params = json_node_get_object(root);
-	debug_print_json_object("mib_client_app_get_accounts_raw", "request",
-							params);
+	debug_print_json_object("mib_client_app_get_accounts", "request", params);
 	gchar *data = json_object_to_string(params);
 	json_node_unref(root);
+	return data;
+}
 
-	ok = mib_dbus_identity_broker1_call_get_accounts_sync(
-		mib_client_app_get_broker(app), MIB_REQUIRED_BROKER_PROTOCOL_VERSION,
-		mib_client_app_get_correlation_id(app), data, &response,
-		mib_client_app_get_cancellable(app), &error);
-	g_free(data);
-	if (!ok) {
-		g_warning("could not get accounts: %s", error->message);
-		g_error_free(error);
-		return NULL;
-	}
+static GSList *get_accounts_process_response(const gchar *response)
+{
+	JsonArray *accounts_array = NULL;
+	GSList *accounts_list = NULL;
+	MIBAccount *mib_account = NULL;
+
 	JsonObject *accounts = json_object_from_string(response);
-	g_free(response);
 	if (!accounts) {
 		g_warning("could not parse accounts response");
 		return NULL;
 	}
-	debug_print_json_object("mib_client_app_get_accounts_raw", "response",
+	debug_print_json_object("mib_client_app_get_accounts", "response",
 							accounts);
-	return accounts;
-}
 
-/**
- * If no upn is provided, return the first account.
- * On error or when the no account has a matching upn return null.
- */
-static JsonObject *mib_client_app_get_account_by_upn_raw(MIBClientApp *app,
-														 const gchar *upn)
-{
-	JsonObject *accounts = mib_client_app_get_accounts_raw(app);
-	JsonObject *account = NULL;
-	if (!accounts) {
-		return NULL;
-	}
-	JsonArray *accounts_array =
-		json_object_get_array_member(accounts, "accounts");
-	if (!accounts_array) {
-		goto err;
-	}
-	for (guint i = 0; i < json_array_get_length(accounts_array); i++) {
-		JsonObject *_account = json_array_get_object_element(accounts_array, i);
-		if (!upn) {
-			g_debug("no upn provided");
-			account = _account;
-			break;
-		}
-		if (!json_object_has_member(_account, "username"))
-			continue;
-		const gchar *username =
-			json_object_get_string_member(_account, "username");
-		if (g_strcmp0(username, upn) == 0) {
-			g_debug("account matching UPN found");
-			account = _account;
-			break;
-		}
-	}
-	if (account)
-		json_object_ref(account);
-err:
-	json_object_unref(accounts);
-	return account;
-}
-
-GSList *mib_client_app_get_accounts(MIBClientApp *self)
-{
-	g_assert(self);
-
-	JsonObject *accounts = mib_client_app_get_accounts_raw(self);
-	if (!accounts) {
-		return NULL;
-	}
 	if (!json_object_has_member(accounts, "accounts")) {
 		json_object_unref(accounts);
 		return NULL;
 	}
-	JsonArray *accounts_array =
-		json_object_get_array_member(accounts, "accounts");
-	GSList *accounts_list = NULL;
-	MIBAccount *mib_account = NULL;
+
+	accounts_array = json_object_get_array_member(accounts, "accounts");
 	for (guint i = 0; i < json_array_get_length(accounts_array); i++) {
 		JsonObject *account = json_array_get_object_element(accounts_array, i);
 		mib_account = mib_account_from_json(account);
@@ -250,19 +213,146 @@ GSList *mib_client_app_get_accounts(MIBClientApp *self)
 	return g_slist_reverse(accounts_list);
 }
 
+GSList *mib_client_app_get_accounts(MIBClientApp *app)
+{
+	GError *error = NULL;
+	gchar *response = NULL;
+	gchar *data = NULL;
+	GSList *accounts = NULL;
+	gboolean ok;
+
+	g_assert(app);
+
+	data = get_accounts_prepare_request(app);
+
+	ok = mib_dbus_identity_broker1_call_get_accounts_sync(
+		mib_client_app_get_broker(app), MIB_REQUIRED_BROKER_PROTOCOL_VERSION,
+		mib_client_app_get_correlation_id(app), data, &response,
+		mib_client_app_get_cancellable(app), &error);
+	g_free(data);
+	if (!ok) {
+		g_warning("could not get accounts: %s", error->message);
+		g_error_free(error);
+		return NULL;
+	}
+
+	accounts = get_accounts_process_response(response);
+	g_free(response);
+	return accounts;
+}
+
+static void get_accounts_async_cb(GObject *source_object, GAsyncResult *res,
+								  gpointer user_data)
+{
+	GTask *task = G_TASK(user_data);
+	mibdbusIdentityBroker1 *proxy = MIB_DBUS_IDENTITY_BROKER1(source_object);
+	GError *error = NULL;
+	gchar *response = NULL;
+	gboolean ok;
+
+	ok = mib_dbus_identity_broker1_call_get_accounts_finish(proxy, &response,
+															res, &error);
+	if (!ok) {
+		g_task_return_error(task, error);
+	} else {
+		GSList *accounts = get_accounts_process_response(response);
+		g_free(response);
+		g_task_return_pointer(task, accounts, NULL);
+	}
+	g_object_unref(task);
+}
+
+void mib_client_app_get_accounts_async(MIBClientApp *app,
+									   GAsyncReadyCallback callback,
+									   gpointer user_data)
+{
+	GTask *task;
+	gchar *data;
+
+	g_assert(app);
+
+	task = g_task_new(app, mib_client_app_get_cancellable(app), callback,
+					  user_data);
+	data = get_accounts_prepare_request(app);
+
+	mib_dbus_identity_broker1_call_get_accounts(
+		mib_client_app_get_broker(app), MIB_REQUIRED_BROKER_PROTOCOL_VERSION,
+		mib_client_app_get_correlation_id(app), data,
+		mib_client_app_get_cancellable(app), get_accounts_async_cb, task);
+	g_free(data);
+}
+
+GSList *mib_client_app_get_accounts_finish(MIBClientApp *app,
+										   GAsyncResult *result, GError **error)
+{
+	g_assert(app);
+	g_assert(g_task_is_valid(result, app));
+
+	return g_task_propagate_pointer(G_TASK(result), error);
+}
+
 MIBAccount *mib_client_app_get_account_by_upn(MIBClientApp *app,
 											  const gchar *upn)
 {
+	GSList *accounts = mib_client_app_get_accounts(app);
+	MIBAccount *account;
+
 	g_assert(app);
 
-	MIBAccount *mib_account = NULL;
-	JsonObject *account = mib_client_app_get_account_by_upn_raw(app, upn);
-	if (!account) {
-		return NULL;
+	account = find_account_by_upn(accounts, upn);
+	g_slist_free_full(accounts, (GDestroyNotify)g_object_unref);
+	return account;
+}
+
+static void get_account_by_upn_async_cb(GObject *source_object,
+										GAsyncResult *res, gpointer user_data)
+{
+	GTask *task = G_TASK(user_data);
+	MIBClientApp *app = MIB_CLIENT_APP(source_object);
+	const gchar *upn = g_task_get_task_data(task);
+	GError *error = NULL;
+	GSList *accounts;
+
+	accounts = mib_client_app_get_accounts_finish(app, res, &error);
+	if (error) {
+		g_task_return_error(task, error);
+	} else {
+		MIBAccount *account = find_account_by_upn(accounts, upn);
+		g_slist_free_full(accounts, (GDestroyNotify)g_object_unref);
+		if (account) {
+			g_task_return_pointer(task, account, g_object_unref);
+		} else {
+			g_task_return_new_error(task, G_IO_ERROR, G_IO_ERROR_NOT_FOUND,
+									"no account matching the UPN was found");
+		}
 	}
-	mib_account = mib_account_from_json(account);
-	json_object_unref(account);
-	return mib_account;
+	g_object_unref(task);
+}
+
+void mib_client_app_get_account_by_upn_async(MIBClientApp *app,
+											 const gchar *upn,
+											 GAsyncReadyCallback callback,
+											 gpointer user_data)
+{
+	GTask *task;
+
+	g_assert(app);
+
+	task = g_task_new(app, mib_client_app_get_cancellable(app), callback,
+					  user_data);
+	g_task_set_task_data(task, g_strdup(upn), g_free);
+
+	mib_client_app_get_accounts_async(app, get_account_by_upn_async_cb, task);
+}
+
+MIBAccount *mib_client_app_get_account_by_upn_finish(MIBClientApp *app,
+													 GAsyncResult *result,
+													 GError **error)
+{
+	g_assert(app);
+	g_assert(g_task_is_valid(result, app));
+
+	return g_task_propagate_pointer(G_TASK(result), error);
 }
 
 mibdbusIdentityBroker1 *mib_client_app_get_broker(MIBClientApp *self)
@@ -317,22 +407,54 @@ void mib_client_app_set_enforce_interactive(MIBClientApp *self, int enforce)
 	self->enforce_interactive = (char)enforce;
 }
 
-static JsonObject *
-mib_get_linux_broker_version_raw(MIBClientApp *app,
-								 const gchar *msal_cpp_version)
+static gchar *
+linux_broker_version_prepare_request(MIBClientApp *app,
+									 const gchar *msal_cpp_version)
 {
-	GError *error = NULL;
 	JsonObject *params;
 	gchar *params_data;
-	gchar *response;
-	gboolean ok;
 
 	params = json_object_new();
 	json_object_set_string_member(params, "msalCppVersion", msal_cpp_version);
-	debug_print_json_object("mib_get_linux_broker_version_raw", "request",
-							params);
+	debug_print_json_object("mib_get_linux_broker_version", "request", params);
 	params_data = json_object_to_string(params);
 	json_object_unref(params);
+	return params_data;
+}
+
+static gchar *linux_broker_version_process_response(const gchar *response)
+{
+	gchar *version = NULL;
+	JsonObject *version_json = json_object_from_string(response);
+	if (!version_json)
+		goto err;
+	debug_print_json_object("mib_get_linux_broker_version", "response",
+							version_json);
+
+	if (!json_object_has_member(version_json, "linuxBrokerVersion")) {
+		goto err;
+	}
+	version = g_strdup(
+		json_object_get_string_member(version_json, "linuxBrokerVersion"));
+err:
+	if (version_json)
+		json_object_unref(version_json);
+	return version;
+}
+
+gchar *mib_client_app_get_linux_broker_version(MIBClientApp *app,
+											   const gchar *msal_cpp_version)
+{
+	GError *error = NULL;
+	gchar *params_data;
+	gchar *response;
+	gchar *version = NULL;
+	gboolean ok;
+
+	g_assert(app);
+	g_assert(msal_cpp_version);
+
+	params_data = linux_broker_version_prepare_request(app, msal_cpp_version);
 	if (!params_data) {
 		return NULL;
 	}
@@ -347,43 +469,76 @@ mib_get_linux_broker_version_raw(MIBClientApp *app,
 		g_error_free(error);
 		return NULL;
 	}
-	JsonObject *version = json_object_from_string(response);
-	if (!version)
-		goto err;
-	debug_print_json_object("mib_get_linux_broker_version_raw", "response",
-							version);
-err:
+
+	version = linux_broker_version_process_response(response);
 	g_free(response);
 	return version;
 }
 
-gchar *mib_client_app_get_linux_broker_version(MIBClientApp *app,
-											   const gchar *msal_cpp_version)
+static void get_linux_broker_version_async_cb(GObject *source_object,
+											  GAsyncResult *res,
+											  gpointer user_data)
 {
+	GTask *task = G_TASK(user_data);
+	mibdbusIdentityBroker1 *proxy = MIB_DBUS_IDENTITY_BROKER1(source_object);
+	GError *error = NULL;
+	gchar *response = NULL;
+	gboolean ok;
+
+	ok = mib_dbus_identity_broker1_call_get_linux_broker_version_finish(
+		proxy, &response, res, &error);
+	if (!ok) {
+		g_task_return_error(task, error);
+	} else {
+		gchar *version = linux_broker_version_process_response(response);
+		g_free(response);
+		if (version) {
+			g_task_return_pointer(task, version, g_free);
+		} else {
+			g_task_return_new_error(task, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
+									"could not parse broker version response");
+		}
+	}
+	g_object_unref(task);
+}
+
+void mib_client_app_get_linux_broker_version_async(
+	MIBClientApp *app, const gchar *msal_cpp_version,
+	GAsyncReadyCallback callback, gpointer user_data)
+{
+	GTask *task;
+	gchar *params_data;
+
 	g_assert(app);
 	g_assert(msal_cpp_version);
 
-	JsonObject *version_json = NULL;
-	gchar *version = NULL;
-	version_json = mib_get_linux_broker_version_raw(app, msal_cpp_version);
-	if (!version_json ||
-		!json_object_has_member(version_json, "linuxBrokerVersion")) {
-		goto err;
-	}
-	version = g_strdup(
-		json_object_get_string_member(version_json, "linuxBrokerVersion"));
-err:
-	if (version_json)
-		json_object_unref(version_json);
-	return version;
+	task = g_task_new(app, mib_client_app_get_cancellable(app), callback,
+					  user_data);
+	params_data = linux_broker_version_prepare_request(app, msal_cpp_version);
+
+	mib_dbus_identity_broker1_call_get_linux_broker_version(
+		mib_client_app_get_broker(app), MIB_REQUIRED_BROKER_PROTOCOL_VERSION,
+		mib_client_app_get_correlation_id(app), params_data,
+		mib_client_app_get_cancellable(app), get_linux_broker_version_async_cb,
+		task);
+	g_free(params_data);
+}
+
+gchar *mib_client_app_get_linux_broker_version_finish(MIBClientApp *app,
+													  GAsyncResult *result,
+													  GError **error)
+{
+	g_assert(app);
+	g_assert(g_task_is_valid(result, app));
+
+	return g_task_propagate_pointer(G_TASK(result), error);
 }
 
 static JsonObject *
-prepare_prt_auth_params(MIBClientApp *app, JsonObject *account,
-						JsonArray *scopes, const gchar *claims_challenge,
-						JsonObject *auth_scheme, const gchar *renew_token,
-						JsonObject *extra_params, const gchar *sso_url,
-						enum AuthorizationType auth_type)
+prepare_prt_auth_params(MIBClientApp *app, MIBAccount *account, GSList *scopes,
+						const gchar *claims_challenge, MIBPopParams *pop_params,
+						const gchar *renew_token, JsonObject *extra_params,
+						const gchar *sso_url, enum AuthorizationType auth_type)
 {
 	// {
 	//  'accessTokenToRenew': renew_token,
@@ -397,11 +552,17 @@ prepare_prt_auth_params(MIBClientApp *app, JsonObject *account,
 	//  'username': account['username'],
 	//  'ssoUrl': sso_url,
 	// }
+
+	JsonArray *scopes_json = mib_scopes_to_json(scopes);
+	JsonObject *account_json = mib_account_to_json(account);
+
 	JsonNode *account_node = json_node_new(JSON_NODE_OBJECT);
-	json_node_set_object(account_node, account);
+	json_node_set_object(account_node, account_json);
+	json_object_unref(account_json);
 	JsonNode *scopes_node = json_node_new(JSON_NODE_ARRAY);
-	json_node_set_array(scopes_node, scopes);
-	const gchar *username = json_object_get_string_member(account, "username");
+	json_node_set_array(scopes_node, scopes_json);
+	json_array_unref(scopes_json);
+	const gchar *username = mib_account_get_username(account);
 
 	JsonBuilder *builder = json_builder_new();
 	json_builder_begin_object(builder);
@@ -421,9 +582,11 @@ prepare_prt_auth_params(MIBClientApp *app, JsonObject *account,
 		json_builder_set_member_name(builder, "decodedClaims");
 		json_builder_add_string_value(builder, claims_challenge);
 	}
-	if (auth_scheme) {
+	if (pop_params) {
+		JsonObject *auth_scheme = mib_pop_params_to_json(pop_params);
 		JsonNode *auth_scheme_node = json_node_new(JSON_NODE_OBJECT);
 		json_node_set_object(auth_scheme_node, auth_scheme);
+		json_object_unref(auth_scheme);
 		json_builder_set_member_name(builder, "popParams");
 		json_builder_add_value(builder, auth_scheme_node);
 	}
@@ -454,17 +617,13 @@ prepare_prt_auth_params(MIBClientApp *app, JsonObject *account,
 	return auth_params;
 }
 
-static JsonObject *
-mib_acquire_token_silent_raw(MIBClientApp *app, JsonObject *account,
-							 JsonArray *scopes, const gchar *claims_challenge,
-							 JsonObject *auth_scheme, const gchar *renew_token)
+static gchar *acquire_token_silent_prepare_request(
+	MIBClientApp *app, MIBAccount *account, GSList *scopes,
+	const gchar *claims_challenge, MIBPopParams *pop_params,
+	const gchar *renew_token)
 {
-	GError *error = NULL;
-	gchar *response;
-	gboolean ok;
-	JsonObject *token;
 	JsonObject *auth_params = prepare_prt_auth_params(
-		app, account, scopes, claims_challenge, auth_scheme, renew_token, NULL,
+		app, account, scopes, claims_challenge, pop_params, renew_token, NULL,
 		NULL, AT_CACHED_REFRESH_TOKEN);
 	JsonNode *auth_params_node = json_node_new(JSON_NODE_OBJECT);
 	json_node_set_object(auth_params_node, auth_params);
@@ -472,10 +631,33 @@ mib_acquire_token_silent_raw(MIBClientApp *app, JsonObject *account,
 
 	JsonObject *params_obj = json_object_new();
 	json_object_set_member(params_obj, "authParameters", auth_params_node);
-	debug_print_json_object("mib_acquire_token_silent_raw", "request",
-							params_obj);
+	debug_print_json_object("mib_acquire_token_silent", "request", params_obj);
 	gchar *data = json_object_to_string(params_obj);
 	json_object_unref(params_obj);
+
+	return data;
+}
+
+MIBPrt *mib_client_app_acquire_token_silent(MIBClientApp *app,
+											MIBAccount *account, GSList *scopes,
+											const gchar *claims_challenge,
+											MIBPopParams *auth_scheme,
+											const gchar *id_token)
+{
+	GError *error = NULL;
+	gchar *response;
+	gboolean ok;
+	JsonObject *token_json;
+
+	g_assert(app);
+	g_assert(account);
+	g_assert(scopes);
+
+	gchar *data = acquire_token_silent_prepare_request(
+		app, account, scopes, claims_challenge, auth_scheme, id_token);
+	if (!data) {
+		return NULL;
+	}
 
 	ok = mib_dbus_identity_broker1_call_acquire_token_silently_sync(
 		mib_client_app_get_broker(app), MIB_REQUIRED_BROKER_PROTOCOL_VERSION,
@@ -487,59 +669,101 @@ mib_acquire_token_silent_raw(MIBClientApp *app, JsonObject *account,
 		g_error_free(error);
 		return NULL;
 	}
-	token = json_object_from_string(response);
+	token_json = json_object_from_string(response);
 	g_free(response);
-	if (!token) {
+	if (!token_json) {
 		g_warning("could not parse token response");
 		return NULL;
 	}
-	debug_print_json_object("mib_acquire_token_silent_raw", "response", token);
-	return token;
-}
+	debug_print_json_object("mib_acquire_token_silent", "response", token_json);
 
-MIBPrt *mib_client_app_acquire_token_silent(MIBClientApp *app,
-											MIBAccount *account, GSList *scopes,
-											const gchar *claims_challenge,
-											MIBPopParams *auth_scheme,
-											const gchar *id_token)
-{
-	g_assert(app);
-	g_assert(account);
-	g_assert(scopes);
-
-	JsonObject *account_json = mib_account_to_json(account);
-	JsonArray *scopes_array = mib_scopes_to_json(scopes);
-	JsonObject *pop_params = auth_scheme ? mib_pop_params_to_json(auth_scheme) :
-										   NULL;
-	JsonObject *token_json =
-		mib_acquire_token_silent_raw(app, account_json, scopes_array,
-									 claims_challenge, pop_params, id_token);
-	json_object_unref(account_json);
-	json_array_unref(scopes_array);
-	if (pop_params) {
-		json_object_unref(pop_params);
-	}
-	if (!token_json) {
-		return NULL;
-	}
 	MIBPrt *token = mib_prt_from_json(token_json, account);
 	json_object_unref(token_json);
 	return token;
 }
 
-static JsonObject *mib_acquire_token_interactive_raw(
-	MIBClientApp *app, JsonArray *scopes, enum MIB_PROMPT prompt,
-	JsonObject *account, MIB_ARG_UNUSED const gchar *domain_hint,
-	const gchar *claims_challenge, JsonObject *auth_scheme,
+static void acquire_token_silent_async_cb(GObject *source_object,
+										  GAsyncResult *res, gpointer user_data)
+{
+	GTask *task = G_TASK(user_data);
+	mibdbusIdentityBroker1 *proxy = MIB_DBUS_IDENTITY_BROKER1(source_object);
+	MIBAccount *account = g_task_get_task_data(task);
+	GError *error = NULL;
+	gchar *response = NULL;
+	gboolean ok;
+
+	ok = mib_dbus_identity_broker1_call_acquire_token_silently_finish(
+		proxy, &response, res, &error);
+	if (!ok) {
+		g_task_return_error(task, error);
+	} else {
+		JsonObject *token_json = json_object_from_string(response);
+		g_free(response);
+		if (!token_json) {
+			g_task_return_new_error(task, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
+									"could not parse token response");
+		} else {
+			debug_print_json_object("mib_acquire_token_silent", "response",
+									token_json);
+			MIBPrt *token = mib_prt_from_json(token_json, account);
+			json_object_unref(token_json);
+			if (token) {
+				g_task_return_pointer(task, token, g_object_unref);
+			} else {
+				g_task_return_new_error(task, G_IO_ERROR,
+										G_IO_ERROR_INVALID_DATA,
+										"could not parse token from response");
+			}
+		}
+	}
+	g_object_unref(task);
+}
+
+void mib_client_app_acquire_token_silent_async(
+	MIBClientApp *app, MIBAccount *account, GSList *scopes,
+	const gchar *claims_challenge, MIBPopParams *auth_scheme,
+	const gchar *id_token, GAsyncReadyCallback callback, gpointer user_data)
+{
+	GTask *task;
+	gchar *data;
+
+	g_assert(app);
+	g_assert(account);
+	g_assert(scopes);
+
+	task = g_task_new(app, mib_client_app_get_cancellable(app), callback,
+					  user_data);
+	g_task_set_task_data(task, g_object_ref(account), g_object_unref);
+
+	data = acquire_token_silent_prepare_request(
+		app, account, scopes, claims_challenge, auth_scheme, id_token);
+
+	mib_dbus_identity_broker1_call_acquire_token_silently(
+		mib_client_app_get_broker(app), MIB_REQUIRED_BROKER_PROTOCOL_VERSION,
+		mib_client_app_get_correlation_id(app), data,
+		mib_client_app_get_cancellable(app), acquire_token_silent_async_cb,
+		task);
+	g_free(data);
+}
+
+MIBPrt *mib_client_app_acquire_token_silent_finish(MIBClientApp *app,
+												   GAsyncResult *result,
+												   GError **error)
+{
+	g_assert(app);
+	g_assert(g_task_is_valid(result, app));
+
+	return g_task_propagate_pointer(G_TASK(result), error);
+}
+
+static gchar *acquire_token_interactive_prepare_request(
+	MIBClientApp *app, GSList *scopes, enum MIB_PROMPT prompt,
+	MIBAccount *account, MIB_ARG_UNUSED const gchar *domain_hint,
+	const gchar *claims_challenge, MIBPopParams *pop_params,
 	JsonObject *extra_params)
 {
-	GError *error = NULL;
-	gchar *response;
-	gboolean ok;
-	JsonObject *token;
-
 	JsonObject *auth_params = prepare_prt_auth_params(
-		app, account, scopes, claims_challenge, auth_scheme, NULL, extra_params,
+		app, account, scopes, claims_challenge, pop_params, NULL, extra_params,
 		NULL, AT_INTERACTIVE);
 
 	/* TODO: check if this is the correct key */
@@ -560,130 +784,339 @@ static JsonObject *mib_acquire_token_interactive_raw(
 	json_object_unref(auth_params);
 
 	json_object_set_member(params_obj, "authParameters", auth_params_node);
-	debug_print_json_object("mib_acquire_token_interactive_raw", "request",
+	debug_print_json_object("mib_acquire_token_interactive", "request",
 							params_obj);
 	gchar *data = json_object_to_string(params_obj);
 	json_object_unref(params_obj);
+	return data;
+}
 
-	/* disable dbus timeout before call and restore after as user input is needed */
-	mibdbusIdentityBroker1 *gd_proxy = mib_client_app_get_broker(app);
-	g_dbus_proxy_set_default_timeout((GDBusProxy *)gd_proxy, G_MAXINT);
-	ok = mib_dbus_identity_broker1_call_acquire_token_interactively_sync(
-		gd_proxy, MIB_REQUIRED_BROKER_PROTOCOL_VERSION,
-		mib_client_app_get_correlation_id(app), data, &response,
-		mib_client_app_get_cancellable(app), &error);
-	g_dbus_proxy_set_default_timeout((GDBusProxy *)gd_proxy, -1);
-
-	g_free(data);
-	if (!ok) {
-		g_warning("could not acquire token: %s", error->message);
-		g_error_free(error);
-		return NULL;
-	}
-	token = json_object_from_string(response);
-	g_free(response);
-	if (!token) {
+static MIBPrt *acquire_token_interactive_process_response(const gchar *response,
+														  MIBAccount *account)
+{
+	MIBPrt *token = NULL;
+	JsonObject *token_json = json_object_from_string(response);
+	if (!token_json) {
 		g_warning("could not parse token response");
 		return NULL;
 	}
-	debug_print_json_object("mib_acquire_token_interactive_raw", "response",
-							token);
+	debug_print_json_object("mib_acquire_token_interactive", "response",
+							token_json);
+	token = mib_prt_from_json(token_json, account);
+	json_object_unref(token_json);
+
 	return token;
 }
 
 MIBPrt *mib_client_app_acquire_token_interactive(
 	MIBClientApp *app, GSList *scopes, enum MIB_PROMPT prompt,
 	const gchar *login_hint, const gchar *domain_hint,
-	const gchar *claims_challenge, MIBPopParams *auth_scheme)
+	const gchar *claims_challenge, MIBPopParams *pop_params)
 {
+	MIBPrt *token = NULL;
+	gchar *response = NULL;
+	GError *error = NULL;
+	gboolean ok;
+
 	g_assert(app);
 	g_assert(scopes);
 
-	MIBPrt *token = NULL;
-	JsonObject *token_json = NULL;
-	JsonObject *account_json =
-		mib_client_app_get_account_by_upn_raw(app, login_hint);
-	if (!account_json) {
+	MIBAccount *account = mib_client_app_get_account_by_upn(app, login_hint);
+	if (!account) {
 		return NULL;
 	}
-	MIBAccount *fallback_account = mib_account_from_json(account_json);
-
-	JsonArray *scopes_array = mib_scopes_to_json(scopes);
-	JsonObject *pop_params = auth_scheme ? mib_pop_params_to_json(auth_scheme) :
-										   NULL;
 
 	/* first try silent, on error try interactive */
 	if (!mib_client_app_get_enforce_interactive(app)) {
-		token_json =
-			mib_acquire_token_silent_raw(app, account_json, scopes_array,
-										 claims_challenge, pop_params, NULL);
-	}
-	if (token_json) {
-		token = mib_prt_from_json(token_json, fallback_account);
-		json_object_unref(token_json);
+		token = mib_client_app_acquire_token_silent(
+			app, account, scopes, claims_challenge, pop_params, NULL);
 	}
 	if (!token) {
-		token_json = mib_acquire_token_interactive_raw(
-			app, scopes_array, prompt, account_json, domain_hint,
-			claims_challenge, pop_params, NULL);
-		if (token_json) {
-			token = mib_prt_from_json(token_json, fallback_account);
-			json_object_unref(token_json);
+		gchar *data = acquire_token_interactive_prepare_request(
+			app, scopes, prompt, account, domain_hint, claims_challenge,
+			pop_params, NULL);
+
+		/* disable dbus timeout before call and restore after as user input is needed */
+		mibdbusIdentityBroker1 *gd_proxy = mib_client_app_get_broker(app);
+		g_dbus_proxy_set_default_timeout((GDBusProxy *)gd_proxy, G_MAXINT);
+		ok = mib_dbus_identity_broker1_call_acquire_token_interactively_sync(
+			gd_proxy, MIB_REQUIRED_BROKER_PROTOCOL_VERSION,
+			mib_client_app_get_correlation_id(app), data, &response,
+			mib_client_app_get_cancellable(app), &error);
+		g_free(data);
+		g_dbus_proxy_set_default_timeout((GDBusProxy *)gd_proxy, -1);
+		if (!ok) {
+			g_warning("could not acquire token: %s", error->message);
+			g_error_free(error);
+			goto err;
 		}
+
+		token = acquire_token_interactive_process_response(response, account);
+		g_free(response);
 	}
-	json_object_unref(account_json);
-	json_array_unref(scopes_array);
-	if (pop_params) {
-		json_object_unref(pop_params);
-	}
-	g_clear_object(&fallback_account);
+err:
+	g_clear_object(&account);
 	return token;
 }
 
-static JsonObject *prepare_prt_sso_request_data(JsonObject *account,
-												JsonObject *auth_params,
-												const gchar *sso_url)
+static void acquire_token_interactive_async_cb(GObject *source_object,
+											   GAsyncResult *res,
+											   gpointer user_data)
+{
+	GTask *task = G_TASK(user_data);
+	mibdbusIdentityBroker1 *proxy = MIB_DBUS_IDENTITY_BROKER1(source_object);
+	InteractiveAsyncCtx *ctx = g_task_get_task_data(task);
+	GError *error = NULL;
+	gchar *response = NULL;
+	gboolean ok;
+
+	/* restore default dbus timeout */
+	g_dbus_proxy_set_default_timeout((GDBusProxy *)proxy, -1);
+
+	ok = mib_dbus_identity_broker1_call_acquire_token_interactively_finish(
+		proxy, &response, res, &error);
+	if (!ok) {
+		g_task_return_error(task, error);
+	} else {
+		MIBPrt *token =
+			acquire_token_interactive_process_response(response, ctx->account);
+		g_free(response);
+		if (token) {
+			g_task_return_pointer(task, token, g_object_unref);
+		} else {
+			g_task_return_new_error(
+				task, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
+				"could not parse interactive token response");
+		}
+	}
+	g_object_unref(task);
+}
+
+static void interactive_async_start_interactive(GTask *task)
+{
+	InteractiveAsyncCtx *ctx = g_task_get_task_data(task);
+	MIBClientApp *app = g_task_get_source_object(task);
+
+	gchar *data = acquire_token_interactive_prepare_request(
+		app, ctx->scopes, ctx->prompt, ctx->account, ctx->domain_hint,
+		ctx->claims_challenge, ctx->pop_params, NULL);
+
+	/* disable dbus timeout as user input is needed */
+	mibdbusIdentityBroker1 *gd_proxy = mib_client_app_get_broker(app);
+	g_dbus_proxy_set_default_timeout((GDBusProxy *)gd_proxy, G_MAXINT);
+
+	mib_dbus_identity_broker1_call_acquire_token_interactively(
+		gd_proxy, MIB_REQUIRED_BROKER_PROTOCOL_VERSION,
+		mib_client_app_get_correlation_id(app), data,
+		mib_client_app_get_cancellable(app), acquire_token_interactive_async_cb,
+		task);
+	g_free(data);
+}
+
+static void interactive_silent_cb(GObject *source_object, GAsyncResult *res,
+								  gpointer user_data)
+{
+	GTask *task = G_TASK(user_data);
+	mibdbusIdentityBroker1 *proxy = MIB_DBUS_IDENTITY_BROKER1(source_object);
+	InteractiveAsyncCtx *ctx = g_task_get_task_data(task);
+	GError *error = NULL;
+	gchar *response = NULL;
+	gboolean ok;
+
+	ok = mib_dbus_identity_broker1_call_acquire_token_silently_finish(
+		proxy, &response, res, &error);
+	if (ok) {
+		JsonObject *token_json = json_object_from_string(response);
+		g_free(response);
+		if (token_json) {
+			debug_print_json_object("mib_acquire_token_silent", "response",
+									token_json);
+			MIBPrt *token = mib_prt_from_json(token_json, ctx->account);
+			json_object_unref(token_json);
+			if (token) {
+				g_task_return_pointer(task, token, g_object_unref);
+				g_object_unref(task);
+				return;
+			}
+		}
+	} else {
+		g_error_free(error);
+	}
+
+	/* Silent failed, fall back to interactive */
+	interactive_async_start_interactive(task);
+}
+
+static void interactive_get_accounts_cb(GObject *source_object,
+										GAsyncResult *res, gpointer user_data)
+{
+	GTask *task = G_TASK(user_data);
+	mibdbusIdentityBroker1 *proxy = MIB_DBUS_IDENTITY_BROKER1(source_object);
+	InteractiveAsyncCtx *ctx = g_task_get_task_data(task);
+	MIBClientApp *app = g_task_get_source_object(task);
+	GError *error = NULL;
+	gchar *response = NULL;
+	gboolean ok;
+
+	ok = mib_dbus_identity_broker1_call_get_accounts_finish(proxy, &response,
+															res, &error);
+	if (!ok) {
+		g_task_return_error(task, error);
+		g_object_unref(task);
+		return;
+	}
+
+	GSList *accounts = get_accounts_process_response(response);
+	g_free(response);
+
+	MIBAccount *account = find_account_by_upn(accounts, ctx->login_hint);
+
+	if (!account) {
+		g_slist_free_full(accounts, (GDestroyNotify)g_object_unref);
+		g_task_return_new_error(task, G_IO_ERROR, G_IO_ERROR_NOT_FOUND,
+								"could not find account for login hint");
+		g_object_unref(task);
+		return;
+	}
+
+	ctx->account = account;
+	g_slist_free_full(accounts, (GDestroyNotify)g_object_unref);
+
+	/* Try silent first (unless enforce_interactive) */
+	if (!mib_client_app_get_enforce_interactive(app)) {
+		gchar *data = acquire_token_silent_prepare_request(
+			app, ctx->account, ctx->scopes, ctx->claims_challenge,
+			ctx->pop_params, NULL);
+
+		mib_dbus_identity_broker1_call_acquire_token_silently(
+			mib_client_app_get_broker(app),
+			MIB_REQUIRED_BROKER_PROTOCOL_VERSION,
+			mib_client_app_get_correlation_id(app), data,
+			mib_client_app_get_cancellable(app), interactive_silent_cb, task);
+		g_free(data);
+		return;
+	}
+
+	/* Go straight to interactive */
+	interactive_async_start_interactive(task);
+}
+
+void mib_client_app_acquire_token_interactive_async(
+	MIBClientApp *app, GSList *scopes, enum MIB_PROMPT prompt,
+	const gchar *login_hint, const gchar *domain_hint,
+	const gchar *claims_challenge, MIBPopParams *pop_params,
+	GAsyncReadyCallback callback, gpointer user_data)
+{
+	GTask *task;
+	InteractiveAsyncCtx *ctx;
+
+	g_assert(app);
+	g_assert(scopes);
+
+	task = g_task_new(app, mib_client_app_get_cancellable(app), callback,
+					  user_data);
+
+	ctx = g_new0(InteractiveAsyncCtx, 1);
+	ctx->scopes = g_slist_copy_deep(scopes, copy_string, NULL);
+	ctx->prompt = prompt;
+	ctx->login_hint = g_strdup(login_hint);
+	ctx->domain_hint = g_strdup(domain_hint);
+	ctx->claims_challenge = g_strdup(claims_challenge);
+	ctx->pop_params = pop_params ? g_object_ref(pop_params) : NULL;
+	g_task_set_task_data(task, ctx, interactive_async_ctx_free);
+
+	/* Step 1: get accounts async */
+	gchar *data = get_accounts_prepare_request(app);
+	mib_dbus_identity_broker1_call_get_accounts(
+		mib_client_app_get_broker(app), MIB_REQUIRED_BROKER_PROTOCOL_VERSION,
+		mib_client_app_get_correlation_id(app), data,
+		mib_client_app_get_cancellable(app), interactive_get_accounts_cb, task);
+	g_free(data);
+}
+
+MIBPrt *mib_client_app_acquire_token_interactive_finish(MIBClientApp *app,
+														GAsyncResult *result,
+														GError **error)
+{
+	g_assert(app);
+	g_assert(g_task_is_valid(result, app));
+
+	return g_task_propagate_pointer(G_TASK(result), error);
+}
+
+static gchar *acquire_prt_sso_cookie_request_prepare(MIBClientApp *app,
+													 MIBAccount *account,
+													 GSList *scopes,
+													 const gchar *sso_url)
 {
 	// {
 	//  'account': account,
 	//  'authParameters': params,
 	//  'ssoUrl': sso_url
 	// }
+	gchar *data = NULL;
+
+	JsonObject *auth_params =
+		prepare_prt_auth_params(app, account, scopes, NULL, NULL, NULL, NULL,
+								sso_url, AT_PRT_SSO_COOKIE);
+	JsonObject *account_json = mib_account_to_json(account);
+
 	JsonObject *params_obj = json_object_new();
 	JsonNode *account_node = json_node_new(JSON_NODE_OBJECT);
-	json_node_set_object(account_node, account);
+	json_node_set_object(account_node, account_json);
+	json_object_unref(account_json);
 	JsonNode *auth_params_node = json_node_new(JSON_NODE_OBJECT);
 	json_node_set_object(auth_params_node, auth_params);
+	json_object_unref(auth_params);
 	JsonNode *sso_url_node = json_node_new(JSON_NODE_VALUE);
 	json_node_set_string(sso_url_node, sso_url);
 
 	json_object_set_member(params_obj, "account", account_node);
 	json_object_set_member(params_obj, "authParameters", auth_params_node);
 	json_object_set_member(params_obj, "ssoUrl", sso_url_node);
-	return params_obj;
+
+	debug_print_json_object("mib_acquire_prt_sso_cookie", "request",
+							params_obj);
+	data = json_object_to_string(params_obj);
+	json_object_unref(params_obj);
+
+	return data;
 }
 
-static JsonObject *mib_acquire_prt_sso_cookie_raw(MIBClientApp *app,
-												  JsonObject *account,
-												  const gchar *sso_url,
-												  JsonArray *scopes)
+static MIBPrtSsoCookie *
+acquire_prt_sso_cookie_process_response(const gchar *response)
 {
-	JsonObject *cookie;
+	MIBPrtSsoCookie *cookie = NULL;
+	JsonObject *cookie_json = json_object_from_string(response);
+	if (!cookie_json) {
+		g_warning("could not parse PRT SSO cookie response");
+		return NULL;
+	}
+	debug_print_json_object("mib_acquire_prt_sso_cookie", "response",
+							cookie_json);
+	cookie = mib_prt_sso_cookie_from_json(cookie_json);
+	json_object_unref(cookie_json);
+	return cookie;
+}
+
+MIBPrtSsoCookie *mib_client_app_acquire_prt_sso_cookie(MIBClientApp *app,
+													   MIBAccount *account,
+													   const gchar *sso_url,
+													   GSList *scopes)
+{
+	MIBPrtSsoCookie *cookie = NULL;
 	gchar *data;
 	GError *error = NULL;
 	gchar *response;
 	gboolean ok;
 
-	JsonObject *auth_params =
-		prepare_prt_auth_params(app, account, scopes, NULL, NULL, NULL, NULL,
-								sso_url, AT_PRT_SSO_COOKIE);
-	JsonObject *params =
-		prepare_prt_sso_request_data(account, auth_params, sso_url);
-	debug_print_json_object("mib_acquire_prt_sso_cookie_raw", "request",
-							params);
-	data = json_object_to_string(params);
-	json_object_unref(params);
-	json_object_unref(auth_params);
+	g_assert(app);
+	g_assert(account);
+	g_assert(sso_url);
+	g_assert(scopes);
+
+	data =
+		acquire_prt_sso_cookie_request_prepare(app, account, scopes, sso_url);
 
 	ok = mib_dbus_identity_broker1_call_acquire_prt_sso_cookie_sync(
 		mib_client_app_get_broker(app), MIB_REQUIRED_BROKER_PROTOCOL_VERSION,
@@ -695,127 +1128,254 @@ static JsonObject *mib_acquire_prt_sso_cookie_raw(MIBClientApp *app,
 		g_error_free(error);
 		return NULL;
 	}
-	cookie = json_object_from_string(response);
+	cookie = acquire_prt_sso_cookie_process_response(response);
 	g_free(response);
-	if (!cookie) {
-		g_warning("could not parse PRT SSO cookie response");
-		return NULL;
-	}
-	debug_print_json_object("mib_acquire_prt_sso_cookie_raw", "response",
-							cookie);
 	return cookie;
 }
 
-MIBPrtSsoCookie *mib_client_app_acquire_prt_sso_cookie(MIBClientApp *app,
-													   MIBAccount *account,
-													   const gchar *sso_url,
-													   GSList *scopes)
+static void acquire_prt_sso_cookie_async_cb(GObject *source_object,
+											GAsyncResult *res,
+											gpointer user_data)
 {
+	GTask *task = G_TASK(user_data);
+	mibdbusIdentityBroker1 *proxy = MIB_DBUS_IDENTITY_BROKER1(source_object);
+	GError *error = NULL;
+	gchar *response = NULL;
+	gboolean ok;
+
+	ok = mib_dbus_identity_broker1_call_acquire_prt_sso_cookie_finish(
+		proxy, &response, res, &error);
+	if (!ok) {
+		g_task_return_error(task, error);
+	} else {
+		MIBPrtSsoCookie *cookie =
+			acquire_prt_sso_cookie_process_response(response);
+		g_free(response);
+		if (cookie) {
+			g_task_return_pointer(task, cookie, g_object_unref);
+		} else {
+			g_task_return_new_error(task, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
+									"could not parse PRT SSO cookie response");
+		}
+	}
+	g_object_unref(task);
+}
+
+void mib_client_app_acquire_prt_sso_cookie_async(
+	MIBClientApp *app, MIBAccount *account, const gchar *sso_url,
+	GSList *scopes, GAsyncReadyCallback callback, gpointer user_data)
+{
+	GTask *task;
+	gchar *data;
+
 	g_assert(app);
 	g_assert(account);
 	g_assert(sso_url);
 	g_assert(scopes);
 
-	JsonObject *account_json = mib_account_to_json(account);
-	JsonArray *scopes_array = mib_scopes_to_json(scopes);
-	JsonObject *cookie_json = mib_acquire_prt_sso_cookie_raw(
-		app, account_json, sso_url, scopes_array);
-	json_object_unref(account_json);
-	json_array_unref(scopes_array);
-	if (!cookie_json) {
-		return NULL;
-	}
-	MIBPrtSsoCookie *cookie = mib_prt_sso_cookie_from_json(cookie_json);
-	json_object_unref(cookie_json);
-	return cookie;
+	task = g_task_new(app, mib_client_app_get_cancellable(app), callback,
+					  user_data);
+
+	data =
+		acquire_prt_sso_cookie_request_prepare(app, account, scopes, sso_url);
+
+	mib_dbus_identity_broker1_call_acquire_prt_sso_cookie(
+		mib_client_app_get_broker(app), MIB_REQUIRED_BROKER_PROTOCOL_VERSION,
+		mib_client_app_get_correlation_id(app), data,
+		mib_client_app_get_cancellable(app), acquire_prt_sso_cookie_async_cb,
+		task);
+	g_free(data);
 }
 
-static JsonObject *mib_generate_signed_http_request_raw(MIBClientApp *app,
-														JsonObject *pop_params)
+MIBPrtSsoCookie *mib_client_app_acquire_prt_sso_cookie_finish(
+	MIBClientApp *app, GAsyncResult *result, GError **error)
 {
-	GError *error = NULL;
-	gboolean ok;
-	gchar *response;
-	JsonObject *params = json_object_new();
+	g_assert(app);
+	g_assert(g_task_is_valid(result, app));
+
+	return g_task_propagate_pointer(G_TASK(result), error);
+}
+
+static gchar *generate_signed_http_request_prepare_request(
+	MIBClientApp *app, MIBAccount *account, MIBPopParams *pop_params)
+{
+	gchar *data = NULL;
+	const gchar *account_id = NULL;
+	JsonObject *pop_params_json = NULL;
+	JsonObject *params;
+
+	if (pop_params) {
+		pop_params_json = mib_pop_params_to_json(pop_params);
+	} else {
+		pop_params_json = json_object_new();
+	}
+	account_id = mib_account_get_home_account_id(account);
+	json_object_set_string_member(pop_params_json, "homeAccountId", account_id);
+
+	params = json_object_new();
 	json_object_set_string_member(params, "clientId",
 								  mib_client_app_get_client_id(app));
-	json_object_ref(pop_params);
-	json_object_set_object_member(params, "popParams", pop_params);
-	debug_print_json_object("mib_generate_signed_http_request_raw", "request",
+	json_object_set_object_member(params, "popParams", pop_params_json);
+
+	debug_print_json_object("mib_generate_signed_http_request", "request",
 							params);
-	gchar *params_data = json_object_to_string(params);
+
+	data = json_object_to_string(params);
 	json_object_unref(params);
+	return data;
+}
 
-	ok = mib_dbus_identity_broker1_call_generate_signed_http_request_sync(
-		mib_client_app_get_broker(app), MIB_REQUIRED_BROKER_PROTOCOL_VERSION,
-		mib_client_app_get_correlation_id(app), params_data, &response,
-		mib_client_app_get_cancellable(app), &error);
-
-	g_free(params_data);
-	if (!ok) {
-		g_warning("could not generate signed HTTP request: %s", error->message);
-		g_error_free(error);
-		return NULL;
-	}
-	JsonObject *token = json_object_from_string(response);
-	g_free(response);
-	if (!token) {
+static gchar *
+generate_signed_http_request_process_response(const gchar *response)
+{
+	gchar *access_token = NULL;
+	JsonObject *token_json = json_object_from_string(response);
+	if (!token_json) {
 		g_warning("could not parse signed HTTP request response");
 		return NULL;
 	}
-	debug_print_json_object("mib_generate_signed_http_request_raw", "response",
-							token);
-	return token;
+	debug_print_json_object("mib_generate_signed_http_request", "response",
+							token_json);
+
+	if (!json_object_has_member(token_json, "signedHttpRequest")) {
+		g_warning("response json is missing 'signedHttpRequest'");
+		goto err;
+	}
+	access_token = g_strdup(
+		json_object_get_string_member(token_json, "signedHttpRequest"));
+err:
+	json_object_unref(token_json);
+	return access_token;
 }
 
 gchar *mib_client_app_generate_signed_http_request(MIBClientApp *app,
 												   MIBAccount *account,
 												   MIBPopParams *pop_params)
 {
-	JsonObject *params_json;
+	GError *error = NULL;
+	gboolean ok;
+	gchar *response;
+	gchar *data = NULL;
 	gchar *access_token = NULL;
-	const gchar *account_id = NULL;
 
 	g_assert(app);
 	g_assert(account);
 
-	if (pop_params) {
-		params_json = mib_pop_params_to_json(pop_params);
-	} else {
-		params_json = json_object_new();
-	}
-	account_id = mib_account_get_home_account_id(account);
-	json_object_set_string_member(params_json, "homeAccountId", account_id);
-	JsonObject *token = mib_generate_signed_http_request_raw(app, params_json);
-	json_object_unref(params_json);
-	if (!token) {
+	data =
+		generate_signed_http_request_prepare_request(app, account, pop_params);
+
+	ok = mib_dbus_identity_broker1_call_generate_signed_http_request_sync(
+		mib_client_app_get_broker(app), MIB_REQUIRED_BROKER_PROTOCOL_VERSION,
+		mib_client_app_get_correlation_id(app), data, &response,
+		mib_client_app_get_cancellable(app), &error);
+	g_free(data);
+	if (!ok) {
+		g_warning("could not generate signed HTTP request: %s", error->message);
+		g_error_free(error);
 		return NULL;
 	}
-	if (!json_object_has_member(token, "signedHttpRequest")) {
-		g_warning("response json is missing 'signedHttpRequest'");
-		goto err;
-	}
-	access_token =
-		g_strdup(json_object_get_string_member(token, "signedHttpRequest"));
-err:
-	json_object_unref(token);
+	access_token = generate_signed_http_request_process_response(response);
+	g_free(response);
 	return access_token;
 }
 
-static int mib_remove_account_raw(MIBClientApp *app, JsonObject *account)
+static void generate_signed_http_request_async_cb(GObject *source_object,
+												  GAsyncResult *res,
+												  gpointer user_data)
+{
+	GTask *task = G_TASK(user_data);
+	mibdbusIdentityBroker1 *proxy = MIB_DBUS_IDENTITY_BROKER1(source_object);
+	GError *error = NULL;
+	gchar *response = NULL;
+	gboolean ok;
+
+	ok = mib_dbus_identity_broker1_call_generate_signed_http_request_finish(
+		proxy, &response, res, &error);
+	if (!ok) {
+		g_task_return_error(task, error);
+	} else {
+		gchar *access_token =
+			generate_signed_http_request_process_response(response);
+		g_free(response);
+		if (access_token) {
+			g_task_return_pointer(task, access_token, g_free);
+		} else {
+			g_task_return_new_error(
+				task, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
+				"could not parse signed HTTP request response");
+		}
+	}
+	g_object_unref(task);
+}
+
+void mib_client_app_generate_signed_http_request_async(
+	MIBClientApp *app, MIBAccount *account, MIBPopParams *pop_params,
+	GAsyncReadyCallback callback, gpointer user_data)
+{
+	GTask *task;
+	gchar *data;
+
+	g_assert(app);
+	g_assert(account);
+
+	task = g_task_new(app, mib_client_app_get_cancellable(app), callback,
+					  user_data);
+
+	data =
+		generate_signed_http_request_prepare_request(app, account, pop_params);
+
+	mib_dbus_identity_broker1_call_generate_signed_http_request(
+		mib_client_app_get_broker(app), MIB_REQUIRED_BROKER_PROTOCOL_VERSION,
+		mib_client_app_get_correlation_id(app), data,
+		mib_client_app_get_cancellable(app),
+		generate_signed_http_request_async_cb, task);
+	g_free(data);
+}
+
+gchar *mib_client_app_generate_signed_http_request_finish(MIBClientApp *app,
+														  GAsyncResult *result,
+														  GError **error)
+{
+	g_assert(app);
+	g_assert(g_task_is_valid(result, app));
+
+	return g_task_propagate_pointer(G_TASK(result), error);
+}
+
+static gchar *remove_account_prepare_request(MIBClientApp *app,
+											 MIBAccount *account)
+{
+	JsonObject *params = json_object_new();
+	json_object_set_string_member(params, "clientId", app->client_id);
+	json_object_set_object_member(params, "account",
+								  mib_account_to_json(account));
+
+	debug_print_json_object("mib_remove_account", "request", params);
+
+	gchar *data = json_object_to_string(params);
+	json_object_unref(params);
+	return data;
+}
+
+static void remove_account_process_response(const gchar *response)
+{
+	JsonObject *resp_json = json_object_from_string(response);
+	debug_print_json_object("mib_remove_account", "response", resp_json);
+	if (resp_json)
+		json_object_unref(resp_json);
+}
+
+int mib_client_app_remove_account(MIBClientApp *app, MIBAccount *account)
 {
 	GError *error = NULL;
 	gboolean ok;
 	gchar *response = NULL;
+	gchar *data = NULL;
 
-	JsonObject *params = json_object_new();
-	json_object_set_string_member(params, "clientId", app->client_id);
-	json_object_set_object_member(params, "account", json_object_ref(account));
+	g_assert(app);
+	g_assert(account);
 
-	debug_print_json_object("mib_remove_account_raw", "request", params);
-
-	gchar *data = json_object_to_string(params);
-	json_object_unref(params);
+	data = remove_account_prepare_request(app, account);
 	ok = mib_dbus_identity_broker1_call_remove_account_sync(
 		mib_client_app_get_broker(app), MIB_REQUIRED_BROKER_PROTOCOL_VERSION,
 		mib_client_app_get_correlation_id(app), data, &response,
@@ -827,23 +1387,60 @@ static int mib_remove_account_raw(MIBClientApp *app, JsonObject *account)
 		g_error_free(error);
 		return -1;
 	}
-	JsonObject *resp_json = json_object_from_string(response);
+	remove_account_process_response(response);
 	g_free(response);
-	debug_print_json_object("mib_remove_account_raw", "response", resp_json);
-	if (resp_json)
-		json_object_unref(resp_json);
 	return 0;
 }
 
-int mib_client_app_remove_account(MIBClientApp *app, MIBAccount *account)
+static void remove_account_async_cb(GObject *source_object, GAsyncResult *res,
+									gpointer user_data)
 {
+	GTask *task = G_TASK(user_data);
+	mibdbusIdentityBroker1 *proxy = MIB_DBUS_IDENTITY_BROKER1(source_object);
+	GError *error = NULL;
+	gchar *response = NULL;
+	gboolean ok;
+
+	ok = mib_dbus_identity_broker1_call_remove_account_finish(proxy, &response,
+															  res, &error);
+	if (!ok) {
+		g_task_return_error(task, error);
+	} else {
+		remove_account_process_response(response);
+		g_free(response);
+		g_task_return_int(task, 0);
+	}
+	g_object_unref(task);
+}
+
+void mib_client_app_remove_account_async(MIBClientApp *app, MIBAccount *account,
+										 GAsyncReadyCallback callback,
+										 gpointer user_data)
+{
+	GTask *task;
+	gchar *data;
+
 	g_assert(app);
 	g_assert(account);
-	int ret = 0;
 
-	JsonObject *account_json = mib_account_to_json(account);
-	ret = mib_remove_account_raw(app, account_json);
+	task = g_task_new(app, mib_client_app_get_cancellable(app), callback,
+					  user_data);
 
-	json_object_unref(account_json);
-	return ret;
+	data = remove_account_prepare_request(app, account);
+
+	mib_dbus_identity_broker1_call_remove_account(
+		mib_client_app_get_broker(app), MIB_REQUIRED_BROKER_PROTOCOL_VERSION,
+		mib_client_app_get_correlation_id(app), data,
+		mib_client_app_get_cancellable(app), remove_account_async_cb, task);
+	g_free(data);
+}
+
+int mib_client_app_remove_account_finish(MIBClientApp *app,
+										 GAsyncResult *result, GError **error)
+{
+	g_assert(app);
+	g_assert(g_task_is_valid(result, app));
+
+	gboolean ok = g_task_propagate_int(G_TASK(result), error) == 0;
+	return ok ? 0 : -1;
 }
