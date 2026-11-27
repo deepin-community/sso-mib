@@ -68,7 +68,7 @@ $ sso-mib-tool acquireTokenInteractive -f json \
     -s <client_id> \
     -r https://login.microsoftonline.com/common/oauth2/nativeclient \
     -x <authority> \
-    -S offline_access -S 'https://outlook.office365.com/SMTP.Send'
+    -S 'https://outlook.office365.com/SMTP.Send'
 ```
 
 ## Maintainers
@@ -84,7 +84,7 @@ Since version `v0.5`, git release tags are signed with one of the following main
 
 Since version `v0.8`, the following keys are used:
 
-    3785ED68D0F83B7BD7D23D7FE1136CEB2754A0BD (Felix Moessbauer)
+- `3785ED68D0F83B7BD7D23D7FE1136CEB2754A0BD` (Felix Moessbauer)
 
 ## License
 

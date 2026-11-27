@@ -9,22 +9,41 @@ libsso-mib.so.0 libsso-mib0 #MINVER#
  mib_account_get_name@Base 0.5.0
  mib_account_get_password_expiry@Base 0.5.0
  mib_account_get_realm@Base 0.5.0
+ mib_account_get_type@Base 0.10.0
  mib_account_get_username@Base 0.5.0
  mib_client_app_acquire_prt_sso_cookie@Base 0.5.0
+ mib_client_app_acquire_prt_sso_cookie_async@Base 0.10.0
+ mib_client_app_acquire_prt_sso_cookie_finish@Base 0.10.0
  mib_client_app_acquire_token_interactive@Base 0.5.0
+ mib_client_app_acquire_token_interactive_async@Base 0.10.0
+ mib_client_app_acquire_token_interactive_finish@Base 0.10.0
  mib_client_app_acquire_token_silent@Base 0.5.0
+ mib_client_app_acquire_token_silent_async@Base 0.10.0
+ mib_client_app_acquire_token_silent_finish@Base 0.10.0
  mib_client_app_generate_signed_http_request@Base 0.5.0
+ mib_client_app_generate_signed_http_request_async@Base 0.10.0
+ mib_client_app_generate_signed_http_request_finish@Base 0.10.0
  mib_client_app_get_account_by_upn@Base 0.5.0
+ mib_client_app_get_account_by_upn_async@Base 0.10.2
+ mib_client_app_get_account_by_upn_finish@Base 0.10.2
  mib_client_app_get_accounts@Base 0.5.0
+ mib_client_app_get_accounts_async@Base 0.10.0
+ mib_client_app_get_accounts_finish@Base 0.10.0
  mib_client_app_get_authority@Base 0.5.0
  mib_client_app_get_broker_redirect_uri@Base 0.5.0
  mib_client_app_get_client_id@Base 0.5.0
  mib_client_app_get_correlation_id@Base 0.5.0
  mib_client_app_get_enforce_interactive@Base 0.5.0
  mib_client_app_get_linux_broker_version@Base 0.5.0
+ mib_client_app_get_linux_broker_version_async@Base 0.10.0
+ mib_client_app_get_linux_broker_version_finish@Base 0.10.0
+ mib_client_app_get_type@Base 0.10.0
  mib_client_app_remove_account@Base 0.6.0
+ mib_client_app_remove_account_async@Base 0.10.0
+ mib_client_app_remove_account_finish@Base 0.10.0
  mib_client_app_set_enforce_interactive@Base 0.5.0
  mib_client_app_set_redirect_uri@Base 0.6.0
+ mib_pop_params_get_type@Base 0.10.0
  mib_pop_params_new@Base 0.5.0
  mib_pop_params_set_kid@Base 0.5.0
  mib_pop_params_set_shr_claims@Base 0.5.0
@@ -36,6 +55,8 @@ libsso-mib.so.0 libsso-mib0 #MINVER#
  mib_prt_get_expires_on@Base 0.5.0
  mib_prt_get_granted_scopes@Base 0.5.0
  mib_prt_get_id_token@Base 0.5.0
+ mib_prt_get_type@Base 0.10.0
  mib_prt_sso_cookie_get_content@Base 0.5.0
  mib_prt_sso_cookie_get_name@Base 0.5.0
+ mib_prt_sso_cookie_get_type@Base 0.10.0
  mib_public_client_app_new@Base 0.5.0

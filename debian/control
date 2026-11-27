@@ -4,6 +4,7 @@ Maintainer: Luca Boccassi <bluca@debian.org>
 Build-Depends: debhelper-compat (= 13),
                dh-package-notes,
                dh-sequence-bash-completion,
+               dbus-daemon <!nocheck>,
                bash-completion,
                libdbus-1-dev,
                libgio-2.0-dev | libgio3.0-cil-dev,

@@ -1,8 +1,24 @@
-sso-mib (0.9.0-1deepin1) unstable; urgency=medium
+sso-mib (0.10.2-1) unstable; urgency=medium
 
-  * Rebuild with LTO enabled (dpkg vendor feature optimize/lto).
+  * Update upstream source from tag 'upstream/0.10.2'
+  * Update symbols file for new release
 
- -- lichenggang <lichenggang@uniontech.com>  Sat, 12 Sep 2026 16:25:46 +0800
+ -- Luca Boccassi <bluca@debian.org>  Tue, 01 Sep 2026 10:36:13 +0100
+
+sso-mib (0.10.1-1) unstable; urgency=medium
+
+  * Update upstream source from tag 'upstream/0.10.1'
+
+ -- Luca Boccassi <bluca@debian.org>  Wed, 15 Jul 2026 16:53:05 +0100
+
+sso-mib (0.10.0-1) unstable; urgency=medium
+
+  * Update upstream source from tag 'upstream/0.10.0'
+  * Install new manpages
+  * Update symbols file for 0.10.0
+  * Use local D-Bus session for unit tests
+
+ -- Luca Boccassi <bluca@debian.org>  Fri, 03 Jul 2026 14:05:50 +0100
 
 sso-mib (0.9.0-1) unstable; urgency=medium
 

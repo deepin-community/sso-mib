@@ -5,3 +5,11 @@ include /usr/share/debhelper/dh_package_notes/package-notes.mk
 
 %:
 	dh $@
+
+override_dh_auto_test:
+	dbus-run-session -- \
+		sh -euc 'export DBUS_SYSTEM_BUS_ADDRESS="$$DBUS_SESSION_BUS_ADDRESS"; exec "$$@"' \
+		sh \
+		dh_auto_test \
+		-- \
+		$(NULL)
